@@ -58,7 +58,33 @@ trait HasFields
                     }
                     $instance->{$property->name} = $castsExists ? CastHandler::cast($property, $value) : $value;
                 }
+            }
+        }
 
+        foreach ($properties as $property) {
+            $hasManyAttributes = $property->getAttributes(HasMany::class);
+            foreach ($hasManyAttributes as $attribute) {
+                $relatedClass = $attribute->newInstance()->class;
+                $field = $attribute->newInstance()->name ?? $property->name;
+
+                if (isset($response->{$field}) && is_array($response->{$field})) {
+                    $relatedIds = $response->{$field};
+
+                    // Check if related IDs are in [id, name] format or just IDs
+                    // Adjust according to your Odoo response structure
+                    $justIds = array_map(function($item) {
+                        return is_array($item) && isset($item[0]) ? $item[0] : $item;
+                    }, $relatedIds);
+
+                    // Fetch related models
+                    $relatedModels = $relatedClass::read($justIds);
+
+                    // Assign to property
+                    $instance->{$property->name} = $relatedModels;
+                } else {
+                    // Initialize as empty array if no related IDs
+                    $instance->{$property->name} = [];
+                }
             }
         }
 
@@ -79,10 +105,12 @@ trait HasFields
             foreach ($attributes as $attribute) {
                 $field = $attribute->newInstance()->name ?? $property->name;
                 if ($property->isInitialized($model)) {
-                    $item->{$field} = $castsExists ? CastHandler::uncast($property, $model->{$property->name}) : $model->{$property->name} ;
+                    $item->{$field} = $castsExists ? CastHandler::uncast($property, $model->{$property->name}) : $model->{$property->name};
                 }
             }
+        }
 
+        foreach ($properties as $property) {
             $hasManyRelations = $property->getAttributes(HasMany::class);
             foreach ($hasManyRelations as $attribute) {
                 $field = $attribute->newInstance()->name ?? $property->name;
