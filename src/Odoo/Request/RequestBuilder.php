@@ -59,6 +59,16 @@ class RequestBuilder
             options: $this->options
         );
     }
+     /**
+     * Check if a group by clause exists.
+     * @return bool
+     */
+    public function hasGroupBy(): bool
+    {
+        // Check if the protected property from the HasGroupBy trait is set and not empty
+        return isset($this->groupBy) && !empty($this->groupBy);
+    }
+
 
     public function collect(): iterable
     {
