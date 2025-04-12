@@ -155,9 +155,9 @@ class OdooModel
     }
 
     /**
-     * Load relationships for the current model instance.
+     * Load relationships for the current model instance, supporting nested loading.
      *
-     * @param string ...$relations Names of the relationship properties to load.
+     * @param string ...$relations Names of the relationship properties to load (e.g., 'category', 'category.parent').
      * @return $this
      * @throws ConfigurationException|OdooModelException
      */
@@ -166,31 +166,8 @@ class OdooModel
         if (!$this->exists()) {
             throw new OdooModelException("Cannot load relations on a non-existent model.");
         }
-
-        $allRelationDefs = static::getRelationAttributes();
-        $modelsToLoad = [$this]; // Load for this single model
-
-        foreach ($relations as $relationName) {
-            if (!isset($allRelationDefs[$relationName])) {
-                throw new ConfigurationException("Relation '{$relationName}' not defined on " . static::class);
-            }
-
-            $definition = $allRelationDefs[$relationName];
-            /** @var BelongsTo|HasMany $attribute */
-            $attribute = $definition['attribute'];
-            $relatedClass = $attribute->related;
-
-            if (!class_exists($relatedClass) || !is_subclass_of($relatedClass, OdooModel::class)) {
-                 throw new ConfigurationException("Relation '{$relationName}' on " . static::class . " points to an invalid OdooModel class '{$relatedClass}'.");
-            }
-
-            match ($definition['type']) {
-                'BelongsTo' => static::loadBelongsToRelation($modelsToLoad, $relationName, $attribute),
-                'HasMany'   => static::loadHasManyRelation($modelsToLoad, $relationName, $attribute),
-                default     => throw new RuntimeException("Unknown relation type {$definition['type']}"),
-            };
-        }
-
+        // Delegate to the static method which handles nesting
+        static::loadRelations([$this], ...$relations);
         return $this;
     }
 
@@ -216,51 +193,127 @@ class OdooModel
 
 
     /**
-     * Eager load relationships for a collection of models.
+     * Eager load relationships for a collection of models, supporting nested loading.
      *
      * @param iterable<OdooModel> $models The collection of models.
-     * @param string ...$relations Names of the relationship properties to load.
+     * @param string ...$relations Names of the relationship properties to load (e.g., 'category', 'category.parent').
      * @return iterable<OdooModel> The collection with relations loaded.
-     * @throws ConfigurationException
+     * @throws ConfigurationException|RuntimeException
      */
     public static function loadRelations(iterable $models, string ...$relations): iterable
     {
-        if (empty($relations)) {
-            return $models;
-        }
-
-        // Convert iterable to array for easier processing, handle empty case
         $modelsArray = is_array($models) ? $models : iterator_to_array($models);
-        if (empty($modelsArray)) {
+        if (empty($modelsArray) || empty($relations)) {
             return $modelsArray;
         }
 
-        // Get relation definitions from the first model (assuming homogeneous collection)
         $firstModel = reset($modelsArray);
         if (!$firstModel instanceof OdooModel) {
-             return $modelsArray; // Or throw error if non-model found
+            // Handle non-model items if necessary, or assume homogeneous collection
+            return $modelsArray;
         }
-        $allRelationDefs = $firstModel::getRelationAttributes();
+        $modelClass = get_class($firstModel);
 
-        foreach ($relations as $relationName) {
-            if (!isset($allRelationDefs[$relationName])) {
-                throw new ConfigurationException("Relation '{$relationName}' not defined on " . get_class($firstModel));
+        // Parse relations: Group nested relations under their first segment
+        // e.g., ['category.parent', 'category.child.grandchild', 'variant'] ->
+        // [
+        //   'category' => ['parent', 'child.grandchild'],
+        //   'variant' => []
+        // ]
+        $parsedRelations = [];
+        foreach ($relations as $relation) {
+            $segments = explode('.', $relation, 2);
+            $baseRelation = $segments[0];
+            $nested = isset($segments[1]) ? $segments[1] : null; // The rest of the chain
+
+            if (!isset($parsedRelations[$baseRelation])) {
+                $parsedRelations[$baseRelation] = [];
             }
 
-            $definition = $allRelationDefs[$relationName];
+            // Add nested part if it exists and isn't already covered by a shorter path
+            // (e.g., if 'category.parent' exists, don't add 'category.parent.child' explicitly here,
+            // it will be handled recursively)
+            // However, the simpler approach is just to pass the rest of the chain down.
+            if ($nested !== null) {
+                 // Avoid adding duplicates like 'parent' if both 'category.parent' and 'category.parent.child' are requested
+                 if (!in_array($nested, $parsedRelations[$baseRelation])) {
+                    $parsedRelations[$baseRelation][] = $nested;
+                 }
+            }
+        }
+
+        // Load direct relations and trigger nested loading
+        $allRelationDefs = $modelClass::getRelationAttributes();
+
+        foreach ($parsedRelations as $baseRelation => $nestedRelationsToLoad) {
+            // Check if the relation is already loaded on *all* models (simple check)
+            // More complex checks could verify if it's loaded on *any* model that needs it.
+            $alreadyLoaded = true;
+            foreach($modelsArray as $model) {
+                if (!isset($model->{$baseRelation})) {
+                    // Note: This check might be insufficient if the relation was loaded but resulted in null.
+                    // A better check might involve tracking loaded relations state, but adds complexity.
+                    // Let's proceed assuming we reload if requested, simplifying the logic.
+                     $alreadyLoaded = false;
+                     break;
+                }
+            }
+            // Skip loading this level if it seems already loaded (basic optimization)
+            // if ($alreadyLoaded) continue; // Commented out for simplicity - explicit request forces reload
+
+
+            if (!isset($allRelationDefs[$baseRelation])) {
+                throw new ConfigurationException("Relation '{$baseRelation}' not defined on " . $modelClass);
+            }
+
+            $definition = $allRelationDefs[$baseRelation];
             /** @var BelongsTo|HasMany $attribute */
             $attribute = $definition['attribute'];
+            /** @var class-string<OdooModel> $relatedClass */
             $relatedClass = $attribute->related;
 
-             if (!class_exists($relatedClass) || !is_subclass_of($relatedClass, OdooModel::class)) {
-                 throw new ConfigurationException("Relation '{$relationName}' on " . get_class($firstModel) . " points to an invalid OdooModel class '{$relatedClass}'.");
+            if (!class_exists($relatedClass) || !is_subclass_of($relatedClass, OdooModel::class)) {
+                throw new ConfigurationException("Relation '{$baseRelation}' on {$modelClass} points to an invalid OdooModel class '{$relatedClass}'.");
             }
 
+            // Load the base relation for the current set of models
             match ($definition['type']) {
-                'BelongsTo' => static::loadBelongsToRelation($modelsArray, $relationName, $attribute),
-                'HasMany'   => static::loadHasManyRelation($modelsArray, $relationName, $attribute),
-                 default     => throw new RuntimeException("Unknown relation type {$definition['type']}"),
+                'BelongsTo' => static::loadBelongsToRelation($modelsArray, $baseRelation, $attribute),
+                'HasMany'   => static::loadHasManyRelation($modelsArray, $baseRelation, $attribute),
+                default     => throw new RuntimeException("Unknown relation type {$definition['type']}"),
             };
+
+            // --- Nested Loading Trigger ---
+            if (!empty($nestedRelationsToLoad)) {
+                // Collect the unique related models that were just loaded across the collection
+                $relatedModelsToLoadNestedOn = [];
+                foreach ($modelsArray as $model) {
+                    // Access the just-loaded relation property
+                    $relatedData = $model->{$baseRelation} ?? null;
+
+                    if ($relatedData === null) continue;
+
+                    if (is_array($relatedData)) { // HasMany relation result
+                        foreach($relatedData as $relatedItem){
+                             // Ensure it's a valid model and use ID as key for uniqueness
+                            if($relatedItem instanceof OdooModel && $relatedItem->exists()){
+                                 $relatedModelsToLoadNestedOn[$relatedItem->id] = $relatedItem;
+                            }
+                        }
+                    } elseif ($relatedData instanceof OdooModel && $relatedData->exists()) { // BelongsTo relation result
+                         $relatedModelsToLoadNestedOn[$relatedData->id] = $relatedData;
+                    }
+                    // Ignore non-model results or non-existent models
+                }
+
+                // If we collected any valid related models, recursively call loadRelations on them
+                // Pass the *nested* relation strings (e.g., 'parent', 'child.grandchild')
+                if (!empty($relatedModelsToLoadNestedOn)) {
+                    // The $relatedClass variable holds the class name (e.g., Category::class)
+                    $relatedClass::loadRelations($relatedModelsToLoadNestedOn, ...$nestedRelationsToLoad);
+                }
+            }
+            // --- End Nested Loading Trigger ---
         }
 
         return $modelsArray;
