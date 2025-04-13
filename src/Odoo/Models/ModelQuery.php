@@ -50,11 +50,6 @@ class ModelQuery
 
     /**
      * Execute the query and get the results.
-     *
-     * @return array<OdooModel>
-     */
-        /**
-     * Execute the query and get the results.
      * Detects if groupBy is set and calls the appropriate read method.
      *
      * @return array<OdooModel|object> Returns OdooModel instances if not grouping,
@@ -62,32 +57,14 @@ class ModelQuery
      */
     public function get(): array
     {
-        // The RequestBuilder's get() method handles the logic
-        // of calling searchRead vs readGroup based on whether groupBy is set.
         $results = $this->builder->get();
 
-        // If NOT grouping, results are raw data suitable for hydration.
-        // If grouping, results are already the grouped summary objects.
-        // We need to check if grouping was performed to decide whether to hydrate.
-
-        // Access the underlying builder to check if groupBy was used.
-        // This relies on RequestBuilder having a way to check this, like hasGroupBy()
-        // Or examining the internal state if HasGroupBy trait doesn't provide a public checker
-        // Let's assume RequestBuilder's get already returned the correct format.
-        // If the builder->get() returned raw data (from searchRead), hydrate it.
-        // If it returned grouped data (from readGroup), return it as is.
-
-        // Check if the result looks like grouped data (contains __count or __domain usually)
-        // Or rely on the fact that hydration would likely fail for grouped data structure
-        if ($this->builder->hasGroupBy() ) { // Assuming RequestBuilder has this public check from the trait
-             return $results; // Return the raw grouped data
+        if ($this->builder->hasGroupBy() ) {
+             return $results;
         } else {
-            // Hydrate only if it was a standard searchRead result
             $models = array_map(fn($item) => $this->newInstance($item), $results);
-             // Eager load relations if requested
             if (!empty($this->with)) {
                  $modelClass = get_class($this->model);
-                 // Ensure loadRelations returns array, not Collection if used internally
                  $loadedModels = $modelClass::loadRelations($models, ...$this->with);
                  return is_array($loadedModels) ? $loadedModels : iterator_to_array($loadedModels);
             }
