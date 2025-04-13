@@ -23,7 +23,6 @@ class OdooModel
     private static Odoo $odoo;
     private static ?string $model = null;
 
-    /** @var array Cache for relationship attributes */
     private static array $relationAttributesCache = [];
 
     public static function boot(Odoo $odoo)
@@ -73,7 +72,7 @@ class OdooModel
 
     public function exists()
     {
-        return isset($this->id) && $this->id > 0; // Ensure ID is valid
+        return isset($this->id);
     }
 
     /**
@@ -112,10 +111,9 @@ class OdooModel
 
         $relations = [];
         $reflectionClass = new ReflectionClass($class);
-        $properties = $reflectionClass->getProperties(ReflectionProperty::IS_PUBLIC); // Only public properties
+        $properties = $reflectionClass->getProperties(ReflectionProperty::IS_PUBLIC);
 
         foreach ($properties as $property) {
-            // BelongsTo
             $belongsToAttrs = $property->getAttributes(BelongsTo::class);
             if (!empty($belongsToAttrs)) {
                 if (count($belongsToAttrs) > 1) {
@@ -126,21 +124,16 @@ class OdooModel
                     'attribute' => $belongsToAttrs[0]->newInstance(),
                     'property' => $property,
                 ];
-                continue; // Process only one relationship type per property
+                continue;
             }
 
-            // HasMany
             $hasManyAttrs = $property->getAttributes(HasMany::class);
             if (!empty($hasManyAttrs)) {
                 if (count($hasManyAttrs) > 1) {
                     throw new ConfigurationException("Property {$property->getName()} on {$class} cannot have multiple HasMany attributes.");
                 }
-                 // Ensure the property type is array or iterable
                 $type = $property->getType();
                 if (!$type || !($type->getName() === 'array' || is_subclass_of($type->getName(), \Traversable::class))) {
-                     // Or check if nullable array type etc.
-                    // throw new ConfigurationException("Property {$property->getName()} on {$class} with HasMany attribute must be typed as array or iterable.");
-                    // Allow untyped for now, but typing is recommended.
                 }
                 $relations[$property->getName()] = [
                     'type' => 'HasMany',
@@ -157,7 +150,7 @@ class OdooModel
     /**
      * Load relationships for the current model instance, supporting nested loading.
      *
-     * @param string ...$relations Names of the relationship properties to load (e.g., 'category', 'category.parent').
+     * @param string ...$relations Names of the relationship properties to load.
      * @return $this
      * @throws ConfigurationException|OdooModelException
      */
@@ -166,7 +159,6 @@ class OdooModel
         if (!$this->exists()) {
             throw new OdooModelException("Cannot load relations on a non-existent model.");
         }
-        // Delegate to the static method which handles nesting
         static::loadRelations([$this], ...$relations);
         return $this;
     }
@@ -196,7 +188,7 @@ class OdooModel
      * Eager load relationships for a collection of models, supporting nested loading.
      *
      * @param iterable<OdooModel> $models The collection of models.
-     * @param string ...$relations Names of the relationship properties to load (e.g., 'category', 'category.parent').
+     * @param string ...$relations Names of the relationship properties to load.
      * @return iterable<OdooModel> The collection with relations loaded.
      * @throws ConfigurationException|RuntimeException
      */
@@ -209,111 +201,79 @@ class OdooModel
 
         $firstModel = reset($modelsArray);
         if (!$firstModel instanceof OdooModel) {
-            // Handle non-model items if necessary, or assume homogeneous collection
             return $modelsArray;
         }
         $modelClass = get_class($firstModel);
 
-        // Parse relations: Group nested relations under their first segment
-        // e.g., ['category.parent', 'category.child.grandchild', 'variant'] ->
-        // [
-        //   'category' => ['parent', 'child.grandchild'],
-        //   'variant' => []
-        // ]
         $parsedRelations = [];
         foreach ($relations as $relation) {
             $segments = explode('.', $relation, 2);
             $baseRelation = $segments[0];
-            $nested = isset($segments[1]) ? $segments[1] : null; // The rest of the chain
+            $nested = isset($segments[1]) ? $segments[1] : null;
 
             if (!isset($parsedRelations[$baseRelation])) {
                 $parsedRelations[$baseRelation] = [];
             }
 
-            // Add nested part if it exists and isn't already covered by a shorter path
-            // (e.g., if 'category.parent' exists, don't add 'category.parent.child' explicitly here,
-            // it will be handled recursively)
-            // However, the simpler approach is just to pass the rest of the chain down.
             if ($nested !== null) {
-                 // Avoid adding duplicates like 'parent' if both 'category.parent' and 'category.parent.child' are requested
                  if (!in_array($nested, $parsedRelations[$baseRelation])) {
                     $parsedRelations[$baseRelation][] = $nested;
                  }
             }
         }
 
-        // Load direct relations and trigger nested loading
         $allRelationDefs = $modelClass::getRelationAttributes();
 
         foreach ($parsedRelations as $baseRelation => $nestedRelationsToLoad) {
-            // Check if the relation is already loaded on *all* models (simple check)
-            // More complex checks could verify if it's loaded on *any* model that needs it.
             $alreadyLoaded = true;
             foreach($modelsArray as $model) {
                 if (!isset($model->{$baseRelation})) {
-                    // Note: This check might be insufficient if the relation was loaded but resulted in null.
-                    // A better check might involve tracking loaded relations state, but adds complexity.
-                    // Let's proceed assuming we reload if requested, simplifying the logic.
                      $alreadyLoaded = false;
                      break;
                 }
             }
-            // Skip loading this level if it seems already loaded (basic optimization)
-            // if ($alreadyLoaded) continue; // Commented out for simplicity - explicit request forces reload
-
+            if ($alreadyLoaded) continue;
 
             if (!isset($allRelationDefs[$baseRelation])) {
                 throw new ConfigurationException("Relation '{$baseRelation}' not defined on " . $modelClass);
             }
 
             $definition = $allRelationDefs[$baseRelation];
-            /** @var BelongsTo|HasMany $attribute */
             $attribute = $definition['attribute'];
-            /** @var class-string<OdooModel> $relatedClass */
             $relatedClass = $attribute->related;
 
             if (!class_exists($relatedClass) || !is_subclass_of($relatedClass, OdooModel::class)) {
                 throw new ConfigurationException("Relation '{$baseRelation}' on {$modelClass} points to an invalid OdooModel class '{$relatedClass}'.");
             }
 
-            // Load the base relation for the current set of models
             match ($definition['type']) {
                 'BelongsTo' => static::loadBelongsToRelation($modelsArray, $baseRelation, $attribute),
                 'HasMany'   => static::loadHasManyRelation($modelsArray, $baseRelation, $attribute),
                 default     => throw new RuntimeException("Unknown relation type {$definition['type']}"),
             };
 
-            // --- Nested Loading Trigger ---
             if (!empty($nestedRelationsToLoad)) {
-                // Collect the unique related models that were just loaded across the collection
                 $relatedModelsToLoadNestedOn = [];
                 foreach ($modelsArray as $model) {
-                    // Access the just-loaded relation property
                     $relatedData = $model->{$baseRelation} ?? null;
 
                     if ($relatedData === null) continue;
 
-                    if (is_array($relatedData)) { // HasMany relation result
+                    if (is_array($relatedData)) {
                         foreach($relatedData as $relatedItem){
-                             // Ensure it's a valid model and use ID as key for uniqueness
                             if($relatedItem instanceof OdooModel && $relatedItem->exists()){
                                  $relatedModelsToLoadNestedOn[$relatedItem->id] = $relatedItem;
                             }
                         }
-                    } elseif ($relatedData instanceof OdooModel && $relatedData->exists()) { // BelongsTo relation result
+                    } elseif ($relatedData instanceof OdooModel && $relatedData->exists()) {
                          $relatedModelsToLoadNestedOn[$relatedData->id] = $relatedData;
                     }
-                    // Ignore non-model results or non-existent models
                 }
 
-                // If we collected any valid related models, recursively call loadRelations on them
-                // Pass the *nested* relation strings (e.g., 'parent', 'child.grandchild')
                 if (!empty($relatedModelsToLoadNestedOn)) {
-                    // The $relatedClass variable holds the class name (e.g., Category::class)
                     $relatedClass::loadRelations($relatedModelsToLoadNestedOn, ...$nestedRelationsToLoad);
                 }
             }
-            // --- End Nested Loading Trigger ---
         }
 
         return $modelsArray;
@@ -329,51 +289,43 @@ class OdooModel
      */
     protected static function loadBelongsToRelation(array $models, string $relationName, BelongsTo $attribute): void
     {
-        /** @var class-string<OdooModel> $relatedClass */
         $relatedClass = $attribute->related;
-        $foreignKeyProperty = $attribute->foreignKey; // PHP Property name holding the ID
+        $foreignKeyProperty = $attribute->foreignKey;
 
-        // Collect foreign key IDs from the models
         $foreignKeys = [];
         foreach ($models as $model) {
-             // Check if the foreign key property exists and is initialized
              if (property_exists($model, $foreignKeyProperty) && isset($model->{$foreignKeyProperty})) {
                 $fkValue = $model->{$foreignKeyProperty};
                 if (is_int($fkValue) && $fkValue > 0) {
-                    $foreignKeys[$fkValue] = $fkValue; // Use keys for uniqueness
+                    $foreignKeys[$fkValue] = $fkValue;
                 }
              } else {
-                 // Handle cases where FK property might not exist or be set, maybe log a warning
-                 // Or ensure hydration always sets it (even if null)
+                throw new ConfigurationException("Property {$foreignKeyProperty} not found on model " . get_class($model));
              }
         }
 
         if (empty($foreignKeys)) {
-             // Set relation to null for all models if no valid keys found
              foreach ($models as $model) {
                  $model->{$relationName} = null;
              }
             return;
         }
 
-        // Fetch related models in one query
         $relatedModels = $relatedClass::query()
             ->where('id', 'in', array_values($foreignKeys))
-            ->get(); // Assuming get() returns an array of OdooModel instances
+            ->get();
 
-        // Build a dictionary of related models keyed by their ID
         $relatedDictionary = [];
         foreach ($relatedModels as $relatedModel) {
             $relatedDictionary[$relatedModel->id] = $relatedModel;
         }
 
-        // Assign the related models back to the original models
         foreach ($models as $model) {
             $fkValue = property_exists($model, $foreignKeyProperty) ? ($model->{$foreignKeyProperty} ?? null) : null;
              if ($fkValue && isset($relatedDictionary[$fkValue])) {
                  $model->{$relationName} = $relatedDictionary[$fkValue];
              } else {
-                 $model->{$relationName} = null; // Set to null if not found or FK was null/invalid
+                 $model->{$relationName} = null;
              }
         }
     }
@@ -388,11 +340,9 @@ class OdooModel
      */
     protected static function loadHasManyRelation(array $models, string $relationName, HasMany $attribute): void
     {
-        /** @var class-string<OdooModel> $relatedClass */
         $relatedClass = $attribute->related;
-        $foreignKeyOnRelated = $attribute->foreignKey; // Odoo field name on the related model
+        $foreignKeyOnRelated = $attribute->foreignKey;
 
-        // Collect parent model IDs
         $parentIds = [];
         foreach ($models as $model) {
              if ($model->exists()) {
@@ -401,53 +351,35 @@ class OdooModel
         }
 
         if (empty($parentIds)) {
-            // Set relation to empty array for all models
              foreach ($models as $model) {
                  $model->{$relationName} = [];
              }
             return;
         }
 
-        // Fetch related models in one query using the foreign key on the related table
         $relatedModels = $relatedClass::query()
             ->where($foreignKeyOnRelated, 'in', array_values($parentIds))
-            // ->orderBy(...) // Optionally add default ordering
             ->get();
 
-        // Group related models by the foreign key (which links back to the parent ID)
         $groupedRelated = [];
         foreach ($relatedModels as $relatedModel) {
-            // We need the foreign key *value* from the related model.
-            // Assuming the foreign key property exists and was hydrated correctly.
-            // This assumes the FK property name matches the Odoo field name,
-            // or we need a way to map Odoo field -> PHP property if different.
-            // Let's assume for now hydration makes $relatedModel->{$foreignKeyOnRelated} available.
-            // This might require ensuring the FK field is included in the related model's `fieldNames()`.
-            // A safer approach might be to use Reflection on the related model to find the
-            // property marked with #[Field($foreignKeyOnRelated), Key].
-
-            // --- Safer approach using reflection (simplified) ---
             $fkValue = null;
             $relatedReflection = new ReflectionClass($relatedModel);
             foreach ($relatedReflection->getProperties() as $prop) {
                  $fieldAttrs = $prop->getAttributes(Field::class);
-                 $keyAttrs = $prop->getAttributes(Key::class); // Check for Key attribute too
+                 $keyAttrs = $prop->getAttributes(Key::class);
                  if (!empty($fieldAttrs)) {
-                     /** @var Field $fieldAttrInstance */
                      $fieldAttrInstance = $fieldAttrs[0]->newInstance();
                      $odooFieldName = $fieldAttrInstance->name ?? $prop->getName();
                      if ($odooFieldName === $foreignKeyOnRelated) {
-                         // Check if it's a key field (likely holds just the ID)
                           if (!empty($keyAttrs) && property_exists($relatedModel, $prop->getName())) {
                             $fkValue = $relatedModel->{$prop->getName()};
                             break;
                           }
-                          // If not a Key attribute, it might be [id, name]. Extract ID.
                           elseif (property_exists($relatedModel, $prop->getName()) && is_array($relatedModel->{$prop->getName()}) && isset($relatedModel->{$prop->getName()}[0])) {
                              $fkValue = $relatedModel->{$prop->getName()}[0];
                              break;
                           }
-                          // Fallback if it's just the ID directly (less common for FKs in search_read)
                            elseif (property_exists($relatedModel, $prop->getName()) && is_int($relatedModel->{$prop->getName()})) {
                              $fkValue = $relatedModel->{$prop->getName()};
                              break;
@@ -455,23 +387,16 @@ class OdooModel
                      }
                  }
             }
-            // --- End safer approach ---
-
-            // Original simpler (less safe) approach:
-            // $fkValue = $relatedModel->{$foreignKeyOnRelated} ?? null; // Needs careful hydration setup
-            // if (is_array($fkValue) && isset($fkValue[0])) { $fkValue = $fkValue[0]; } // Handle [id, name]
-
             if ($fkValue !== null && is_int($fkValue)) {
                 $groupedRelated[$fkValue][] = $relatedModel;
             }
         }
 
-        // Assign the grouped related models back to the original models
         foreach ($models as $model) {
             if (isset($groupedRelated[$model->id])) {
                 $model->{$relationName} = $groupedRelated[$model->id];
             } else {
-                $model->{$relationName} = []; // Initialize as empty array if no related found
+                $model->{$relationName} = [];
             }
         }
     }

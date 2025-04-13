@@ -8,7 +8,6 @@ use Obuchmann\OdooJsonRpc\Odoo\Request\RequestBuilder;
 
 class ModelQuery
 {
-    /** @var array<string> Relations to eager load */
     protected array $with = [];
 
     public function __construct(
@@ -25,7 +24,6 @@ class ModelQuery
      */
     private function newInstance(object $values): OdooModel
     {
-        // Use the hydrate method from the *specific* model class
         $class = get_class($this->model);
         return $class::hydrate($values);
     }
@@ -55,16 +53,15 @@ class ModelQuery
      */
     public function get(): array
     {
-        $results = $this->builder->get(); // Returns array of stdClass objects
+        $results = $this->builder->get();
         $models = array_map(fn($item) => $this->newInstance($item), $results);
 
-        // Eager load relations if requested
         if (!empty($this->with)) {
              $modelClass = get_class($this->model);
              $models = $modelClass::loadRelations($models, ...$this->with);
         }
 
-        return $models; // Should be an array of OdooModel instances
+        return $models;
     }
 
     /**
@@ -74,13 +71,11 @@ class ModelQuery
      */
     public function first(): ?OdooModel
     {
-        $item = $this->builder->first(); // Returns stdClass object or null
+        $item = $this->builder->first();
         if (null !== $item) {
             $model = $this->newInstance($item);
 
-            // Eager load relations if requested
              if (!empty($this->with)) {
-                 // Use the instance load method for a single model
                  $model->load(...$this->with);
              }
             return $model;
