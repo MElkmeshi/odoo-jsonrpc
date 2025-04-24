@@ -16,54 +16,7 @@ use stdClass;
 
 trait HasFields
 {
-    protected static function fieldNames(): array
-    {
-        $fieldNames = [];
-
-        $reflectionClass = new \ReflectionClass(static::class);
-        $properties = $reflectionClass->getProperties();
-
-        foreach ($properties as $property) {
-            $attributes = $property->getAttributes(Field::class);
-
-            foreach ($attributes as $attribute) {
-                $fieldInstance = $attribute->newInstance();
-                $fieldNames[] = $fieldInstance->name ?? $property->name;
-            }
-
-            $belongsToAttrs = $property->getAttributes(BelongsTo::class);
-            if (!empty($belongsToAttrs)) {
-                 $belongsToInstance = $belongsToAttrs[0]->newInstance();
-                 $fkPropertyName = $belongsToInstance->foreignKey;
-
-                 if ($reflectionClass->hasProperty($fkPropertyName)) {
-                     $fkProperty = $reflectionClass->getProperty($fkPropertyName);
-                     $fkFieldAttrs = $fkProperty->getAttributes(Field::class);
-                     if (!empty($fkFieldAttrs)) {
-                         $fkFieldInstance = $fkFieldAttrs[0]->newInstance();
-                         $odooFieldName = $fkFieldInstance->name ?? $fkProperty->getName();
-                         $fieldNames[] = $odooFieldName;
-                     }
-                 }
-            }
-
-            $hasManyAttrs = $property->getAttributes(HasMany::class);
-            if (!empty($hasManyAttrs)) {
-                $hasManyInstance = $hasManyAttrs[0]->newInstance();
-                 if ($hasManyInstance->odooRelationshipField !== null) {
-                    $fieldAttrs = $property->getAttributes(Field::class);
-                    foreach ($fieldAttrs as $fieldAttribute) {
-                         $fieldInstance = $fieldAttribute->newInstance();
-                         if (($fieldInstance->name ?? $property->getName()) === $hasManyInstance->odooRelationshipField) {
-                             $fieldNames[] = $hasManyInstance->odooRelationshipField;
-                             break;
-                         }
-                    }
-                 }
-            }
-        }
-        return array_unique($fieldNames);
-    }
+    // fieldNames is now defined in OdooModel to incorporate relation fields
 
     public static function hydrate(object $response): static
     {
@@ -73,6 +26,8 @@ trait HasFields
         $properties = $reflectionClass->getProperties();
 
         $instance = static::newInstance();
+        // Store raw response data for potential later use (like getting related IDs)
+        $instance->_hydratedData = (array) $response;
         $instance->id = $response->id ?? null;
 
         foreach ($properties as $property) {
@@ -97,9 +52,24 @@ trait HasFields
 
                     $propertyType = $property->getType();
                     if ($value !== null || ($propertyType && $propertyType->allowsNull())) {
-                         $instance->{$property->name} = $castsExists ? CastHandler::cast($property, $value) : $value;
-                    } elseif (!isset($instance->{$property->name}) && $property->hasDefaultValue()) {
+                         // Check if the property itself is the target for the HasMany ID list
+                         $hasManyAttrs = $property->getAttributes(HasMany::class);
+                         $isHasManyIdListField = false;
+                         if(!empty($hasManyAttrs)){
+                             $hmInstance = $hasManyAttrs[0]->newInstance();
+                             if($field === $hmInstance->odooRelationshipField) {
+                                 $isHasManyIdListField = true;
+                             }
+                         }
 
+                         // Only hydrate if it's not the special HasMany ID list field OR if it is,
+                         // ensure the value is actually an array (as expected for ID lists)
+                         if(!$isHasManyIdListField || ($isHasManyIdListField && is_array($value))) {
+                            $instance->{$property->name} = $castsExists ? CastHandler::cast($property, $value) : $value;
+                         }
+
+                    } elseif (!isset($instance->{$property->name}) && $property->hasDefaultValue()) {
+                         // Avoid overwriting defaults
                     } elseif (!$property->isInitialized($instance)) {
                         if ($propertyType && $propertyType->allowsNull()) {
                            $instance->{$property->name} = null;
@@ -111,7 +81,6 @@ trait HasFields
                         $instance->{$property->name} = null;
                     }
                 }
-
             }
         }
 
@@ -127,21 +96,38 @@ trait HasFields
         $properties = $reflectionClass->getProperties();
 
         foreach ($properties as $property) {
+            // Skip internal hydration data property
+            if ($property->getName() === '_hydratedData') {
+                continue;
+            }
+
             $fieldAttributes = $property->getAttributes(Field::class);
             foreach ($fieldAttributes as $attribute) {
                 $fieldInstance = $attribute->newInstance();
                 $field = $fieldInstance->name ?? $property->name;
 
-                if (!empty($property->getAttributes(HasMany::class))) {
-                     $hasManyAttrs = $property->getAttributes(HasMany::class);
-                     $hasManyInstance = $hasManyAttrs[0]->newInstance();
-                     if ($field !== $hasManyInstance->odooRelationshipField) {
-                        continue;
-                     }
+                $isHasManyObjectProperty = !empty($property->getAttributes(HasMany::class));
+                $isBelongsToObjectProperty = !empty($property->getAttributes(BelongsTo::class));
+
+                // Determine if this #[Field] corresponds to the odooRelationshipField of a HasMany
+                $isOdooRelationshipIdListField = false;
+                if($isHasManyObjectProperty) {
+                    $hmAttr = $property->getAttributes(HasMany::class)[0]->newInstance();
+                    if ($field === $hmAttr->odooRelationshipField) {
+                        $isOdooRelationshipIdListField = true;
+                    }
                 }
-                 if (!empty($property->getAttributes(BelongsTo::class))) {
-                    continue;
+
+
+                if ($isBelongsToObjectProperty) {
+                    continue; // Skip dehydrating the object property itself
+                }
+
+                // If it's the HasMany object property AND not specifically the ID list field, skip it.
+                 if ($isHasManyObjectProperty && !$isOdooRelationshipIdListField) {
+                     continue;
                  }
+
 
                 if ($property->isInitialized($model) && property_exists($model, $property->getName())) {
                      $rawValue = $model->{$property->name};
@@ -149,13 +135,20 @@ trait HasFields
                 }
             }
 
+            // Handle HasMany relationships specifically for generating Odoo commands
+            // This targets the property holding the ARRAY OF MODELS (e.g., public array $variants)
             $hasManyAttributes = $property->getAttributes(HasMany::class);
             if (!empty($hasManyAttributes)) {
                  $attribute = $hasManyAttributes[0]->newInstance();
-                 $odooFieldName = $attribute->odooRelationshipField ?? $property->name;
+                 $odooFieldName = $attribute->odooRelationshipField; // USE the defined field for commands
+
+                 // If no field defined for commands, we cannot dehydrate this relation meaningfully
+                 if ($odooFieldName === null) {
+                      continue;
+                 }
 
                  if ($property->isInitialized($model) && property_exists($model, $property->getName())) {
-                    $values = $model->{$property->name};
+                    $values = $model->{$property->name}; // Should be an array of OdooModel instances or IDs
 
                     if ($values === null) {
                          continue;
@@ -175,7 +168,6 @@ trait HasFields
                                 if ($value->exists()) {
                                      if (!empty((array)$dehydratedValue)) {
                                          $commands[] = [1, $value->id, $dehydratedValue];
-                                     } else {
                                      }
                                 } else {
                                     $commands[] = [0, 0, $dehydratedValue];
@@ -193,7 +185,6 @@ trait HasFields
                     }
                  }
             }
-
         }
 
         return $item;
@@ -201,7 +192,10 @@ trait HasFields
 
     protected static function newInstance()
     {
-        return new static();
+        $instance = new static();
+        // Add a placeholder for raw data if needed by relation loading
+        $instance->_hydratedData = [];
+        return $instance;
     }
 
     private static function isIdArray(array $arr): bool

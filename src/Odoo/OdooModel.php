@@ -25,10 +25,13 @@ class OdooModel
     private static ?string $modelNameCache = null;
 
     private static array $relationAttributesCache = [];
+    private static array $fieldNamesCache = []; // Cache for field names
 
     protected array $originalAttributes = [];
-
     protected array $loadedRelations = [];
+    // Holds raw data used during hydration, accessible for relation loading
+    public array $_hydratedData = [];
+
 
     public static function boot(Odoo $odoo): void
     {
@@ -45,17 +48,86 @@ class OdooModel
 
     public static function model(): string
     {
-        if (null === self::$modelNameCache) {
-            $reflectionClass = new \ReflectionClass(static::class);
+        $class = static::class;
+        if (!isset(self::$modelNameCache[$class])) {
+            $reflectionClass = new \ReflectionClass($class);
             $modelAttributes = $reflectionClass->getAttributes(Model::class);
             if (empty($modelAttributes)) {
-                 throw new ConfigurationException("Missing #[Model] attribute on class " . static::class);
+                 throw new ConfigurationException("Missing #[Model] attribute on class " . $class);
             }
             $modelInstance = $modelAttributes[0]->newInstance();
-            self::$modelNameCache = $modelInstance->name;
+            self::$modelNameCache[$class] = $modelInstance->name;
         }
-        return self::$modelNameCache;
+        return self::$modelNameCache[$class];
     }
+
+    /**
+     * Calculates and caches the list of Odoo field names to fetch for this model.
+     * Includes fields marked with #[Field] and the odooRelationshipField from #[HasMany].
+     */
+    protected static function fieldNames(): array
+    {
+        $class = static::class;
+        if (isset(self::$fieldNamesCache[$class])) {
+            return self::$fieldNamesCache[$class];
+        }
+
+        $fieldNames = [];
+        $reflectionClass = new \ReflectionClass($class);
+        $properties = $reflectionClass->getProperties();
+
+        foreach ($properties as $property) {
+            // Get fields marked with #[Field]
+            $fieldAttrs = $property->getAttributes(Field::class);
+            foreach ($fieldAttrs as $attribute) {
+                $fieldInstance = $attribute->newInstance();
+                $fieldNames[] = $fieldInstance->name ?? $property->getName();
+            }
+
+            // Get BelongsTo foreign key fields if they have #[Field]
+             $belongsToAttrs = $property->getAttributes(BelongsTo::class);
+             if (!empty($belongsToAttrs)) {
+                  $belongsToInstance = $belongsToAttrs[0]->newInstance();
+                  $fkPropertyName = $belongsToInstance->foreignKey;
+                  if ($reflectionClass->hasProperty($fkPropertyName)) {
+                      $fkProperty = $reflectionClass->getProperty($fkPropertyName);
+                      $fkFieldAttrs = $fkProperty->getAttributes(Field::class);
+                      if (!empty($fkFieldAttrs)) {
+                          $fkFieldInstance = $fkFieldAttrs[0]->newInstance();
+                          $odooFieldName = $fkFieldInstance->name ?? $fkProperty->getName();
+                          $fieldNames[] = $odooFieldName;
+                      }
+                  }
+             }
+
+            // Get HasMany relationship ID list field if defined
+            $hasManyAttrs = $property->getAttributes(HasMany::class);
+            if (!empty($hasManyAttrs)) {
+                /** @var HasMany $hasManyInstance */
+                $hasManyInstance = $hasManyAttrs[0]->newInstance();
+                // *** ADD the Odoo field holding the IDs ***
+                if ($hasManyInstance->odooRelationshipField !== null) {
+                    $fieldNames[] = $hasManyInstance->odooRelationshipField;
+                }
+                // Check if the PHP property itself is mapped via Field to this odooRelationshipField
+                // This handles cases where the user wants the ID list directly on the HasMany property
+                $propFieldAttrs = $property->getAttributes(Field::class);
+                 foreach($propFieldAttrs as $propFieldAttr) {
+                      $propFieldInstance = $propFieldAttr->newInstance();
+                      $propOdooFieldName = $propFieldInstance->name ?? $property->getName();
+                      if ($hasManyInstance->odooRelationshipField !== null && $propOdooFieldName === $hasManyInstance->odooRelationshipField) {
+                           $fieldNames[] = $propOdooFieldName; // Already added above, but ensures it's included if mapped directly
+                      }
+                 }
+            }
+        }
+
+        // Always include 'id'
+        $fieldNames[] = 'id';
+        self::$fieldNamesCache[$class] = array_values(array_unique($fieldNames)); // Ensure unique and re-index
+        return self::$fieldNamesCache[$class];
+    }
+
 
     public static function listFields(?array $fields = null, ?array $attributes = ['string', 'type', 'relation']): object
     {
@@ -124,7 +196,8 @@ class OdooModel
             }
             $this->id = $createResponse;
         }
-
+        // Clear internal hydration data after save? Or re-fetch?
+        $this->_hydratedData = []; // Clear potentially stale data
         return $this;
     }
 
@@ -136,6 +209,7 @@ class OdooModel
         $result = self::odoo()->unlink(static::model(), [$this->id]);
         if ($result) {
             $this->id = null;
+            $this->_hydratedData = [];
         }
         return $result;
     }
@@ -223,6 +297,8 @@ class OdooModel
         $reflectionClass = new \ReflectionClass(static::class);
 
         foreach ($attributes as $key => $value) {
+            if ($key === '_hydratedData') continue; // Don't allow filling internal property
+
             if ($reflectionClass->hasProperty($key)) {
                 $property = $reflectionClass->getProperty($key);
                 if ($property->isPublic()) {
@@ -233,6 +309,8 @@ class OdooModel
                 throw new UndefinedPropertyException("Property {$key} does not exist on model " . static::class);
             }
         }
+        // Filling might invalidate hydrated data if relations depend on it
+        $this->_hydratedData = [];
         return $this;
     }
 
@@ -251,7 +329,6 @@ class OdooModel
         $modelClass = get_class($firstModel);
 
         $parsedRelations = self::parseRelationStrings($relations);
-
         $allRelationDefs = $modelClass::getRelationAttributes();
 
         foreach ($parsedRelations as $baseRelation => $nestedRelationsToLoad) {
@@ -262,6 +339,7 @@ class OdooModel
             $definition = $allRelationDefs[$baseRelation];
             $attribute = $definition['attribute'];
             $relatedClass = $attribute->related;
+            $relationProperty = $definition['property']; // ReflectionProperty
 
             if (!class_exists($relatedClass) || !is_subclass_of($relatedClass, OdooModel::class)) {
                  throw new ConfigurationException("Relation '{$baseRelation}' on {$modelClass} points to an invalid OdooModel class '{$relatedClass}'.");
@@ -272,11 +350,10 @@ class OdooModel
                  fn(OdooModel $model) => !in_array($baseRelation, $model->loadedRelations)
             );
 
-
             if (!empty($modelsToLoadRelationOn)) {
                  match ($definition['type']) {
-                     'BelongsTo' => static::loadBelongsToRelation($modelsToLoadRelationOn, $baseRelation, $attribute),
-                     'HasMany'   => static::loadHasManyRelation($modelsToLoadRelationOn, $baseRelation, $attribute),
+                     'BelongsTo' => static::loadBelongsToRelation($modelsToLoadRelationOn, $relationProperty->getName(), $attribute),
+                     'HasMany'   => static::loadHasManyRelation($modelsToLoadRelationOn, $relationProperty->getName(), $attribute), // Pass attribute instance
                      default     => throw new RuntimeException("Unknown relation type {$definition['type']}"),
                  };
 
@@ -285,11 +362,9 @@ class OdooModel
                  }
              }
 
-
             if (!empty($nestedRelationsToLoad)) {
                 $relatedModelsToLoadNestedOn = [];
                 foreach ($modelsArray as $model) {
-                    $relationProperty = $definition['property'];
                     if ($relationProperty->isInitialized($model)) {
                          $relatedData = $relationProperty->getValue($model);
 
@@ -391,57 +466,91 @@ class OdooModel
         }
     }
 
+    /**
+     * Loads HasMany relation based on IDs fetched previously on the parent model.
+     */
     protected static function loadHasManyRelation(array $models, string $relationName, HasMany $attribute): void
     {
         if (empty($models)) return;
 
+        /** @var class-string<OdooModel> $relatedClass */
         $relatedClass = $attribute->related;
-        $foreignKeyOnRelated = $attribute->foreignKey;
+        $odooRelationshipField = $attribute->odooRelationshipField; // e.g., 'product_variant_ids'
 
-        $parentIds = [];
+        if ($odooRelationshipField === null) {
+            throw new ConfigurationException("Cannot load HasMany relation '{$relationName}' on " . static::class . " using ID list method because 'odooRelationshipField' is not defined in the #[HasMany] attribute.");
+        }
+
+        $modelClass = get_class(reset($models));
+        $reflectionClass = new ReflectionClass($modelClass);
+        $relationProperty = $reflectionClass->getProperty($relationName);
+
+        // Initialize relation to empty array for all models initially
         foreach ($models as $model) {
-             if ($model->exists()) {
-                $parentIds[$model->id] = $model->id;
+             if (!$relationProperty->isInitialized($model)) {
+                 $relationProperty->setValue($model, []);
              }
         }
 
-         $modelClass = get_class(reset($models));
-         $reflectionClass = new ReflectionClass($modelClass);
-         $relationProperty = $reflectionClass->getProperty($relationName);
-         foreach ($models as $model) {
-              if (!$relationProperty->isInitialized($model)) {
-                  $relationProperty->setValue($model, []);
-              }
-         }
+        // Collect all related IDs needed across all parent models
+        $allRelatedIds = [];
+        $modelIdToRelatedIdsMap = []; // Map parent ID -> list of its related IDs
 
-        if (empty($parentIds)) {
+        foreach ($models as $model) {
+            // Access the previously fetched ID list from the raw hydrated data
+            // This assumes fieldNames() included $odooRelationshipField and it was hydrated
+            if (isset($model->_hydratedData[$odooRelationshipField]) && is_array($model->_hydratedData[$odooRelationshipField])) {
+                $relatedIds = $model->_hydratedData[$odooRelationshipField];
+                 // Filter out potential false values or non-integers if Odoo returns them
+                 $relatedIds = array_filter($relatedIds, fn($id) => is_int($id) && $id > 0);
+
+                if (!empty($relatedIds)) {
+                    $modelIdToRelatedIdsMap[$model->id] = $relatedIds;
+                    $allRelatedIds = array_merge($allRelatedIds, $relatedIds);
+                } else {
+                     $modelIdToRelatedIdsMap[$model->id] = []; // Ensure entry exists even if empty
+                }
+            } else {
+                 $modelIdToRelatedIdsMap[$model->id] = []; // Field missing or not array
+            }
+        }
+
+        $uniqueRelatedIds = array_values(array_unique($allRelatedIds));
+
+        if (empty($uniqueRelatedIds)) {
+            // No related IDs found for any model, relation remains empty array
             return;
         }
 
+        // Fetch all required related models in a single query
         $relatedModels = $relatedClass::query()
-            ->where($foreignKeyOnRelated, 'in', array_values($parentIds))
-            ->get();
+            ->where('id', 'in', $uniqueRelatedIds)
+            ->get(); // Returns array of related OdooModel instances
 
-        $groupedRelated = [];
+        // Build a dictionary of fetched related models keyed by their ID
+        $relatedDictionary = [];
         foreach ($relatedModels as $relatedModel) {
-             if (!$relatedModel instanceof OdooModel) continue;
-
-             $fkValue = self::getForeignKeyValueFromRelated($relatedModel, $foreignKeyOnRelated);
-
-             if ($fkValue !== null && is_int($fkValue)) {
-                 if (!isset($groupedRelated[$fkValue])) {
-                     $groupedRelated[$fkValue] = [];
-                 }
-                 $groupedRelated[$fkValue][] = $relatedModel;
+             if ($relatedModel instanceof OdooModel && $relatedModel->exists()) {
+                 $relatedDictionary[$relatedModel->id] = $relatedModel;
              }
         }
 
+        // Assign the fetched models back to the correct parent model
         foreach ($models as $model) {
-            if ($model->exists() && isset($groupedRelated[$model->id])) {
-                $relationProperty->setValue($model, $groupedRelated[$model->id]);
-            }
+             $relatedModelsForThisParent = [];
+             $idsForThisParent = $modelIdToRelatedIdsMap[$model->id] ?? [];
+
+             foreach ($idsForThisParent as $relatedId) {
+                 if (isset($relatedDictionary[$relatedId])) {
+                     $relatedModelsForThisParent[] = $relatedDictionary[$relatedId];
+                 }
+                 // else: Related ID existed in parent list but wasn't found (deleted?), skip it.
+             }
+             // Set the property on the parent model
+             $relationProperty->setValue($model, $relatedModelsForThisParent);
         }
     }
+
 
     private static function getForeignKeyValueFromRelated(OdooModel $relatedModel, string $foreignKeyOdooName): ?int
     {
@@ -493,7 +602,7 @@ class OdooModel
         foreach ($properties as $property) {
             $propertyName = $property->getName();
 
-            if ($property->isStatic() || in_array($propertyName, ['odooInstance', 'modelNameCache', 'relationAttributesCache', 'originalAttributes', 'loadedRelations'])) {
+            if ($property->isStatic() || in_array($propertyName, ['odooInstance', 'modelNameCache', 'relationAttributesCache', 'fieldNamesCache', 'originalAttributes', 'loadedRelations', '_hydratedData'])) {
                  continue;
             }
 
