@@ -39,8 +39,8 @@ class RequestBuilder
     {
         if($this->hasGroupBy()){
             return $this->endpoint->readGroup(
-                $this->model,
-                groupBy: $this->groupBy,
+                model: $this->model,
+                groupBy: $this->groupBy ?? [],
                 domain: $this->domain,
                 fields: $this->fields,
                 offset: $this->offset,
@@ -50,7 +50,7 @@ class RequestBuilder
             );
         }
         return $this->endpoint->searchRead(
-            $this->model,
+            model: $this->model,
             domain: $this->domain,
             fields: $this->fields,
             offset: $this->offset,
@@ -59,35 +59,35 @@ class RequestBuilder
             options: $this->options
         );
     }
-     /**
-     * Check if a group by clause exists.
-     * @return bool
-     */
-    public function hasGroupBy(): bool
-    {
-        // Check if the protected property from the HasGroupBy trait is set and not empty
-        return isset($this->groupBy) && !empty($this->groupBy);
+
+     public function hasGroupBy(): bool
+     {
+        return isset($this->groupBy) && is_array($this->groupBy) && !empty($this->groupBy);
     }
 
 
-    public function collect(): iterable
+    public function collect(): \Illuminate\SupportCollection
     {
         if(!function_exists('collect')){
-            throw new ConfigurationException("collect is not defined. Are you missing Laravel framework?");
+            throw new ConfigurationException("Laravel 'collect' helper function is not defined. Ensure Laravel framework is available.");
         }
         return collect($this->get());
     }
 
     public function first(): ?object
     {
-        $this->limit = 1;
-        return $this->get()[0] ?? null;
+        $originalLimit = $this->limit;
+        $this->limit(1);
+        $result = $this->get()[0] ?? null;
+        $this->limit = $originalLimit;
+
+        return is_object($result) ? $result : null;
     }
 
     public function ids(): array
     {
         return $this->endpoint->search(
-            $this->model,
+            model: $this->model,
             domain: $this->domain,
             offset: $this->offset,
             limit: $this->limit,
@@ -99,7 +99,7 @@ class RequestBuilder
     public function count(): int
     {
         return $this->endpoint->count(
-            $this->model,
+            model: $this->model,
             domain: $this->domain,
             offset: $this->offset,
             limit: $this->limit,
@@ -111,7 +111,9 @@ class RequestBuilder
     public function delete(): bool
     {
         $ids = $this->ids();
-
+        if (empty($ids)) {
+            return true;
+        }
         return $this->endpoint->unlink($this->model, $ids, $this->options);
     }
 
@@ -122,7 +124,15 @@ class RequestBuilder
 
     public function write(array $values): bool
     {
+        unset($values['id']);
+        if (empty($values)) {
+            return true;
+        }
+
         $ids = $this->ids();
+        if (empty($ids)) {
+            return true;
+        }
 
         return $this->endpoint->write($this->model, $ids, $values, $this->options);
     }

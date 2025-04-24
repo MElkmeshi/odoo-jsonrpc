@@ -8,7 +8,6 @@ use Obuchmann\OdooJsonRpc\Odoo\Request\RequestBuilder;
 
 class ModelQuery
 {
-    /** @var array<string> Relations to eager load */
     protected array $with = [];
 
     public function __construct(
@@ -18,16 +17,11 @@ class ModelQuery
     {
     }
 
-    /**
-     * Create a new instance of the model from raw Odoo data.
-     * @param object $values
-     * @return OdooModel
-     */
     private function newInstance(object $values): OdooModel
     {
-        // Use the hydrate method from the *specific* model class
         $class = get_class($this->model);
-        return $class::hydrate($values);
+        $hydratedModel = $class::hydrate($values);
+        return $hydratedModel;
     }
 
 
@@ -36,63 +30,51 @@ class ModelQuery
         return $this->builder->can($permission);
     }
 
-    /**
-     * Specify relationships to eager load.
-     *
-     * @param string ...$relations
-     * @return $this
-     */
     public function with(string ...$relations): static
     {
         $this->with = array_unique(array_merge($this->with, $relations));
         return $this;
     }
 
-    /**
-     * Execute the query and get the results.
-     * Detects if groupBy is set and calls the appropriate read method.
-     *
-     * @return array<OdooModel|object> Returns OdooModel instances if not grouping,
-     *                                or plain objects/arrays from read_group if grouping.
-     */
     public function get(): array
     {
         $results = $this->builder->get();
 
-        if ($this->builder->hasGroupBy() ) {
+        if ($this->builder->hasGroupBy()) {
              return $results;
-        } else {
-            $models = array_map(fn($item) => $this->newInstance($item), $results);
-            if (!empty($this->with)) {
-                 $modelClass = get_class($this->model);
-                 $loadedModels = $modelClass::loadRelations($models, ...$this->with);
-                 return is_array($loadedModels) ? $loadedModels : iterator_to_array($loadedModels);
-            }
-            return $models;
         }
+
+        $models = [];
+        foreach ($results as $item) {
+            if (is_object($item)) {
+                 $models[] = $this->newInstance($item);
+            }
+        }
+
+        if (!empty($this->with) && !empty($models)) {
+             $modelClass = get_class($this->model);
+             $loadedModels = $modelClass::loadRelations($models, ...$this->with);
+             return is_array($loadedModels) ? $loadedModels : iterator_to_array($loadedModels);
+        }
+
+        return $models;
     }
 
 
-    /**
-     * Execute the query and get the first result.
-     *
-     * @return OdooModel|null
-     */
     public function first(): ?OdooModel
     {
-        $item = $this->builder->first(); // Returns stdClass object or null
-        if (null !== $item) {
+        $item = $this->builder->first();
+        if (null !== $item && is_object($item)) {
             $model = $this->newInstance($item);
 
-            // Eager load relations if requested
-             if (!empty($this->with)) {
-                 // Use the instance load method for a single model
+            if (!empty($this->with) && $model->exists()) {
                  $model->load(...$this->with);
-             }
+            }
             return $model;
         }
         return null;
     }
+
     public function count(): int
     {
         return $this->builder->count();
@@ -105,22 +87,26 @@ class ModelQuery
 
     public function update(array $values): bool
     {
+        unset($values['id']);
+        if (empty($values)) {
+            return true;
+        }
         return $this->builder->update($values);
     }
 
-    public function where(string $field, string $operator, $value)
+    public function where(string $field, string $operator, $value): static
     {
         $this->builder->where($field, $operator, $value);
         return $this;
     }
 
-    public function orWhere(string $field, string $operator, $value)
+    public function orWhere(string $field, string $operator, $value): static
     {
         $this->builder->orWhere($field, $operator, $value);
         return $this;
     }
 
-    public function orderBy(string $order, #[ExpectedValues(['asc', 'desc'])] string $direction = 'asc')
+    public function orderBy(string $order, #[ExpectedValues(['asc', 'desc'])] string $direction = 'asc'): static
     {
         $this->builder->orderBy($order, $direction);
         return $this;
@@ -138,33 +124,21 @@ class ModelQuery
         return $this;
     }
 
-    public function fields(array $fields)
+    public function fields(array $fields): static
     {
         $this->builder->fields($fields);
         return $this;
     }
-    /**
-     * Specify fields to group the results by.
-     * This triggers the use of Odoo's read_group method.
-     *
-     * @param array $groupBy Odoo field names to group by.
-     * @return static
-     */
+
     public function groupBy(array $groupBy): static
     {
-        $this->builder->groupBy($groupBy); // Delegate to RequestBuilder
+        $this->builder->groupBy($groupBy);
         return $this;
     }
 
-     /**
-      * Check if a group by clause has been added.
-      * Useful for determining return type from get().
-      *
-      * @return bool
-      */
      public function hasGroupBy(): bool
      {
-        return $this->builder->hasGroupBy(); // Delegate check to RequestBuilder
+        return $this->builder->hasGroupBy();
      }
 
 }
