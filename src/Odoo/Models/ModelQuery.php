@@ -10,11 +10,20 @@ use Obuchmann\OdooJsonRpc\Odoo\Request\RequestBuilder;
 
 class ModelQuery
 {
-    public function __construct(
-        protected OdooModel $model,
-        protected RequestBuilder $builder,
-    )
-    {
+    protected array $with = [];
+
+
+   public function with(array $relations): static
+   {
+       $this->with = $relations;
+       return $this;
+   }
+
+   public function __construct(
+       protected OdooModel $model,
+       protected RequestBuilder $builder,
+   )
+   {
     }
 
     private function newInstance(object $values): OdooModel
@@ -30,16 +39,23 @@ class ModelQuery
 
     public function get(): array
     {
-        return array_map(fn($item) => $this->newInstance($item), $this->builder->get());
+        $items = array_map(fn($item) => $this->newInstance($item), $this->builder->get());
+
+        if (!empty($this->with)) {
+            \Obuchmann\OdooJsonRpc\Odoo\Mapping\EagerLoader::loadRelations($items, $this->with);
+        }
+        return $items;
     }
 
     public function first(): ?OdooModel
     {
         $item = $this->builder->first();
-        if (null !== $item) {
-            return $this->newInstance($item);
-        }
-        return null;
+       if ($item && !empty($this->with)) {
+           $model = $this->newInstance($item);
+           \Obuchmann\OdooJsonRpc\Odoo\Mapping\EagerLoader::loadRelations([$model], $this->with);
+           return $model;
+       }
+        return $item ? $this->newInstance($item) : null;
     }
 
     public function count(): int
